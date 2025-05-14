@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 )
 
 const (
-	DEFAULT_CONTEXT_LIMIT = 5
+	DefaultContextLimit = 5
 )
 
 func main() {
@@ -26,9 +27,11 @@ func main() {
 	ollamaHost := flag.String("ollama", "", "Ollama host (default uses OLLAMA_HOST env var)")
 	model := flag.String("model", "phi3-mini", "Ollama model for answering")
 	embeddingModel := flag.String("embedding-model", "phi3-mini", "Ollama model for embeddings")
-	contextLimit := flag.Int("context", DEFAULT_CONTEXT_LIMIT, "Number of similar contexts to retrieve")
+	contextLimit := flag.Int("context", DefaultContextLimit, "Number of similar contexts to retrieve")
 	interactive := flag.Bool("i", false, "Run in interactive mode")
 	queryFlag := flag.String("q", "", "Query to answer (non-interactive mode)")
+	ruleFilter := flag.String("rule", "", "Filter by rule number (e.g., 'Rule 14')")
+	listRules := flag.Bool("list-rules", false, "List all available rule sections")
 	flag.Parse()
 
 	// Create context
@@ -40,6 +43,20 @@ func main() {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	defer db.Close()
+
+	// List rules if requested
+	if *listRules {
+		sections, err := db.GetRuleSections(ctx)
+		if err != nil {
+			log.Fatalf("Failed to get rule sections: %v", err)
+		}
+
+		fmt.Println("Available Rule Sections:")
+		for _, section := range sections {
+			fmt.Println("  " + section)
+		}
+		return
+	}
 
 	// Create embedder
 	embedder, err := embedding.NewOllamaEmbedder(*ollamaHost, *embeddingModel)
@@ -54,14 +71,14 @@ func main() {
 	}
 
 	if *interactive {
-		runInteractiveMode(ctx, db, embedder, llmClient, *contextLimit)
+		runInteractiveMode(ctx, db, embedder, llmClient, *contextLimit, *ruleFilter)
 	} else {
 		if *queryFlag == "" {
 			log.Fatal("Query is required in non-interactive mode. Use -q 'your question'")
 		}
 
 		// Process a single query
-		answer, err := processQuery(ctx, *queryFlag, db, embedder, llmClient, *contextLimit)
+		answer, err := processQuery(ctx, *queryFlag, db, embedder, llmClient, *contextLimit, *ruleFilter)
 		if err != nil {
 			log.Fatalf("Failed to process query: %v", err)
 		}
@@ -70,10 +87,15 @@ func main() {
 	}
 }
 
-func runInteractiveMode(ctx context.Context, db *database.DB, embedder *embedding.OllamaEmbedder, llmClient *llm.OllamaLLM, contextLimit int) {
+func runInteractiveMode(ctx context.Context, db *database.DB, embedder *embedding.OllamaEmbedder,
+	llmClient *llm.OllamaLLM, contextLimit int, ruleFilter string) {
+
 	scanner := bufio.NewScanner(os.Stdin)
 
 	fmt.Println("Golf Rules Assistant - Ask questions about golf rules (type 'exit' to quit)")
+	if ruleFilter != "" {
+		fmt.Printf("Filtering results to rules matching: %s\n", ruleFilter)
+	}
 
 	for {
 		fmt.Print("\n> ")
@@ -81,19 +103,45 @@ func runInteractiveMode(ctx context.Context, db *database.DB, embedder *embeddin
 			break
 		}
 
-		query := scanner.Text()
-		if strings.ToLower(query) == "exit" || strings.ToLower(query) == "quit" {
+		input := scanner.Text()
+		if strings.ToLower(input) == "exit" || strings.ToLower(input) == "quit" {
 			break
 		}
 
-		if strings.TrimSpace(query) == "" {
+		if strings.TrimSpace(input) == "" {
+			continue
+		}
+
+		// Check for command to set rule filter
+		if strings.HasPrefix(strings.ToLower(input), "/rule ") {
+			ruleFilter = strings.TrimSpace(strings.TrimPrefix(input, "/rule "))
+			if ruleFilter == "" {
+				fmt.Println("Rule filter cleared")
+			} else {
+				fmt.Printf("Rule filter set to: %s\n", ruleFilter)
+			}
+			continue
+		}
+
+		// Check for command to list rules
+		if strings.ToLower(input) == "/list-rules" {
+			sections, err := db.GetRuleSections(ctx)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				continue
+			}
+
+			fmt.Println("Available Rule Sections:")
+			for _, section := range sections {
+				fmt.Println("  " + section)
+			}
 			continue
 		}
 
 		// Show "thinking" indicator
 		fmt.Print("Searching golf rules... ")
 
-		answer, err := processQuery(ctx, query, db, embedder, llmClient, contextLimit)
+		answer, err := processQuery(ctx, input, db, embedder, llmClient, contextLimit, ruleFilter)
 		if err != nil {
 			fmt.Printf("\rError: %v\n", err)
 			continue
@@ -103,7 +151,11 @@ func runInteractiveMode(ctx context.Context, db *database.DB, embedder *embeddin
 	}
 }
 
-func processQuery(ctx context.Context, query string, db *database.DB, embedder *embedding.OllamaEmbedder, llmClient *llm.OllamaLLM, contextLimit int) (*models.Response, error) {
+func processQuery(ctx context.Context, query string, db *database.DB, embedder *embedding.OllamaEmbedder, llmClient *llm.OllamaLLM, contextLimit int, ruleFilter string) (*models.Response, error) {
+	// Extract rule references and golf terms
+	queryRuleRefs := extractRuleReferences(query)
+	golfTerms := identifyGolfTerms(query)
+
 	// Create embedding for query
 	startTime := time.Now()
 	queryEmbedding, err := embedder.EmbedText(ctx, query)
@@ -111,10 +163,17 @@ func processQuery(ctx context.Context, query string, db *database.DB, embedder *
 		return nil, fmt.Errorf("failed to create query embedding: %w", err)
 	}
 
-	// Get similar chunks from database
-	chunks, err := db.QuerySimilar(ctx, queryEmbedding, contextLimit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query similar chunks: %w", err)
+	// Use optimized query function
+	var chunks []models.TextChunk
+	if len(queryRuleRefs) > 0 || ruleFilter != "" {
+		// Use rule-specific querying
+		chunks, err = db.QuerySimilarWithStructure(ctx, queryEmbedding, query, contextLimit)
+	} else if len(golfTerms) > 0 {
+		// Use term-based querying for golf-specific terms
+		chunks, err = db.QuerySimilarWithTerms(ctx, queryEmbedding, golfTerms, contextLimit)
+	} else {
+		// Fall back to regular similarity search
+		chunks, err = db.QuerySimilar(ctx, queryEmbedding, contextLimit)
 	}
 
 	if len(chunks) == 0 {
@@ -165,4 +224,67 @@ func formatAnswer(response *models.Response) string {
 	}
 
 	return sb.String()
+}
+
+// identifyGolfTerms extracts golf-specific terms from the query
+func identifyGolfTerms(query string) []string {
+	var terms []string
+
+	// Golf-specific term patterns
+	patterns := map[string]string{
+		"penalty area":        "penalty area",
+		"bunker":              "bunker",
+		"putting green":       "putting green",
+		"teeing area":         "teeing area",
+		"loose impediment":    "loose impediment",
+		"obstruction":         "obstruction",
+		"out of bounds":       "out of bounds",
+		"OB":                  "out of bounds",
+		"unplayable":          "unplayable ball",
+		"stroke and distance": "stroke-and-distance",
+		// Add more golf terms...
+	}
+
+	for pattern, term := range patterns {
+		if strings.Contains(strings.ToLower(query), pattern) {
+			terms = append(terms, term)
+		}
+	}
+
+	return terms
+}
+
+// extractRuleReferences extracts rule references from a query
+func extractRuleReferences(query string) []string {
+	rulePattern := regexp.MustCompile(`Rule\s+(\d+)(\.\d+)?([a-z])?(\(\d+\))?`)
+	matches := rulePattern.FindAllStringSubmatch(query, -1)
+
+	var ruleRefs []string
+	for _, match := range matches {
+		if len(match) > 0 {
+			// Full match is at index 0
+			ruleRef := match[0]
+			ruleRefs = append(ruleRefs, ruleRef)
+
+			// Also add the main rule number for broader context
+			if len(match) > 1 && match[1] != "" {
+				mainRule := "Rule " + match[1]
+				if !contains(ruleRefs, mainRule) {
+					ruleRefs = append(ruleRefs, mainRule)
+				}
+			}
+		}
+	}
+
+	return ruleRefs
+}
+
+// contains checks if a string slice contains a specific value
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }
