@@ -148,8 +148,10 @@ func (e *OllamaEmbedder) EmbedBatchWithProgress(ctx context.Context, chunks []mo
 		semaphore <- struct{}{} // Acquire semaphore
 
 		go func(i int) {
-			defer wg.Done()
-			defer func() { <-semaphore }() // Release semaphore
+			defer func() {
+				wg.Done()
+				<-semaphore
+			}() // Release semaphore
 
 			// Create embedding for this chunk
 			embedding, err := e.EmbedText(ctx, chunks[i].Content)
